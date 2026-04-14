@@ -1,0 +1,8 @@
+{
+  "name": "ToneMaster",
+  "description": "A professional-grade guitar effects pedalboard for your browser. Connect your guitar via iRig or built-in mic.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": []
+}
