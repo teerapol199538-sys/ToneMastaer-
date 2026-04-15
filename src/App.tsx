@@ -18,7 +18,9 @@ import {
   Clock, 
   Wind,
   SlidersHorizontal,
-  ChevronRight
+  ChevronRight,
+  AlertCircle,
+  HelpCircle
 } from "lucide-react";
 
 // ─────────────────────────────────────────────────────────────
@@ -85,11 +87,118 @@ function useAudioEngine() {
   const [inputLevel, setInputLevel] = useState(0);
   const [tuning, setTuning] = useState({ note: "-", cents: 0 });
   const [isExternal, setIsExternal] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const refs = useRef<any>({});
+
+  const apply = useCallback((params: any) => {
+    const r = refs.current;
+    if (!r.ctx) return;
+    const now = r.ctx.currentTime;
+    const set = (node: any, param: string, val: number) => node[param].setTargetAtTime(val, now, 0.01);
+
+    if (params.noiseGate !== undefined) {
+      set(r.gateGain, "gain", params.noiseGate ? 1 : 1);
+      set(r.compressor, "threshold", params.noiseGate ? (params.threshold ?? -40) : 0);
+    }
+    if (params.compressor) {
+      const c = params.compressor;
+      if (c.enabled !== undefined) {
+        set(r.compressor, "threshold", c.enabled ? (c.threshold ?? -24) : 0);
+        set(r.compressor, "ratio", c.enabled ? (c.ratio ?? 4) : 1);
+      }
+    }
+    if (params.eq) {
+      const e = params.eq;
+      if (e.low !== undefined)  { r.eqLow.frequency.value = e.lowFreq ?? 200;  set(r.eqLow,  "gain", e.enabled ? e.low  : 0); }
+      if (e.mid !== undefined)  { r.eqMid.frequency.value = e.midFreq ?? 1000; set(r.eqMid,  "gain", e.enabled ? e.mid  : 0); }
+      if (e.high !== undefined) { r.eqHigh.frequency.value= e.highFreq?? 4000; set(r.eqHigh, "gain", e.enabled ? e.high : 0); }
+    }
+    if (params.drive) {
+      const d = params.drive;
+      const pre = d.enabled ? 1 + d.gain * 150 : 0;
+      set(r.drivePre, "gain", pre);
+      set(r.dryGain, "gain", d.enabled ? 0 : 1);
+      set(r.drivePost, "gain", d.level * 0.5);
+      r.driveTone.frequency.value = 500 + d.tone * 8000;
+      if (d.enabled) {
+        r.driveShaper.curve =
+          d.mode === "overdrive"   ? makeOverdriveCurve(d.gain)  :
+          d.mode === "distortion"  ? makeDistortionCurve(d.gain) :
+          makeFuzzCurve(d.gain);
+      } else {
+        r.driveShaper.curve = null;
+      }
+    }
+    if (params.mod) {
+      const m = params.mod;
+      r.modShape = m.shape ?? "sine";
+      
+      if (m.shape === "random") {
+        r.modLFOGain.disconnect();
+      } else {
+        try { r.modLFOGain.connect(r.modDelay.delayTime); } catch(e) {}
+        r.modLFO.type = m.shape ?? "sine";
+        r.modLFO.frequency.value = m.rate ?? 1.5;
+      }
+      
+      if (m.mode === "tremolo") {
+        set(r.modLFOGain, "gain", m.enabled ? (m.depth ?? 0.5) * 0.5 : 0);
+        set(r.modWet, "gain", m.enabled ? (m.mix ?? 0.5) : 0);
+        set(r.modFB, "gain", 0);
+        r.modDelay.delayTime.value = 0;
+      } else {
+        set(r.modLFOGain, "gain", m.enabled ? (m.depth ?? 0.5) * 0.008 : 0);
+        set(r.modWet, "gain", m.enabled ? (m.mix ?? 0.5) : 0);
+        set(r.modFB, "gain", m.enabled && m.mode === "flanger" ? 0.5 : 0);
+        if (m.shape !== "random") {
+          r.modDelay.delayTime.value = m.mode === "flanger" ? 0.005 : 0.02;
+        }
+      }
+    }
+    if (params.delay) {
+      const d = params.delay;
+      r.delayNode.delayTime.value = d.time ?? 0.4;
+      set(r.delayFB, "gain", d.enabled ? Math.min(d.feedback ?? 0.4, 0.95) : 0);
+      set(r.delayWet, "gain", d.enabled ? (d.mix ?? 0.35) : 0);
+      set(r.delayDry, "gain", 1);
+    }
+    if (params.amp) {
+      const a = params.amp;
+      r.ampNode.frequency.value = 2000 + a.tone * 8000;
+      set(r.ampGain, "gain", a.enabled ? a.gain : 1);
+      set(r.ampLevel, "gain", a.enabled ? a.level : 0);
+    }
+    if (params.reverb) {
+      const rv = params.reverb;
+      if (rv.enabled) {
+        r.reverbConv.buffer = buildReverbIR(r.ctx, rv.roomSize ?? 0.5, rv.damping ?? 0.5);
+      }
+      set(r.reverbWet, "gain", rv.enabled ? (rv.mix ?? 0.3) : 0);
+      set(r.reverbDry, "gain", 1);
+    }
+    if (params.master !== undefined) {
+      set(r.masterGain, "gain", params.mute ? 0 : params.master);
+    }
+  }, []);
 
   const start = useCallback(async () => {
     try {
       setStatus("connecting");
+
+      // Proactive permission check
+      if (navigator.permissions && (navigator.permissions as any).query) {
+        try {
+          const result = await (navigator.permissions as any).query({ name: 'microphone' });
+          if (result.state === 'denied') {
+            setErrorMessage("Microphone access is blocked in your browser settings. Please click the icon in your address bar to allow access.");
+            setStatus("error");
+            return;
+          }
+        } catch (e) {
+          // Ignore if permission query is not supported for microphone
+        }
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: { ideal: false },
@@ -171,7 +280,6 @@ function useAudioEngine() {
         modShape: "sine",
       };
 
-      // VU + noise gate + tuner loop
       const buf = new Float32Array(analyser.fftSize);
       const tick = () => {
         if (!refs.current.ctx) return;
@@ -179,22 +287,14 @@ function useAudioEngine() {
         const rms = Math.sqrt(buf.reduce((s, v) => s + v * v, 0) / buf.length);
         setInputLevel(Math.min(rms * 6, 1));
         
-        // Simple autocorrelation for pitch detection
-        let maxCorr = 0;
-        let bestLag = -1;
+        let maxCorr = 0, bestLag = -1;
         for (let lag = 50; lag < 500; lag++) {
           let corr = 0;
-          for (let i = 0; i < analyser.fftSize - lag; i++) {
-            corr += buf[i] * buf[i + lag];
-          }
-          if (corr > maxCorr) {
-            maxCorr = corr;
-            bestLag = lag;
-          }
+          for (let i = 0; i < analyser.fftSize - lag; i++) corr += buf[i] * buf[i + lag];
+          if (corr > maxCorr) { maxCorr = corr; bestLag = lag; }
         }
         if (rms > 0.05 && bestLag > 0) {
-          const freq = 44100 / bestLag;
-          setTuning(getNoteFromFrequency(freq));
+          setTuning(getNoteFromFrequency(44100 / bestLag));
         } else {
           setTuning({ note: "-", cents: 0 });
         }
@@ -202,22 +302,22 @@ function useAudioEngine() {
         if (refs.current.modShape === "random") {
           refs.current.modDelay.delayTime.setTargetAtTime(Math.random() * 0.02, refs.current.ctx.currentTime, 0.05);
         }
-        
         requestAnimationFrame(tick);
       };
       tick();
-
       setStatus("active");
     } catch (e: any) {
       console.error(e);
+      let msg = "An unexpected error occurred.";
       if (e.name === 'NotFoundError' || e.name === 'DevicesNotFoundError') {
-        alert("Microphone not found. Please ensure your microphone is connected and permissions are granted.");
+        msg = "Microphone not found. Please ensure your microphone is connected and permissions are granted.";
       } else if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
-        alert("Microphone permission denied. Please allow microphone access in your browser settings.");
+        msg = "Microphone permission denied. Please allow microphone access in your browser settings.";
       }
+      setErrorMessage(msg);
       setStatus("error");
     }
-  }, []);
+  }, [apply, setIsExternal, setStatus]);
 
   const stop = useCallback(() => {
     const r = refs.current;
@@ -225,111 +325,13 @@ function useAudioEngine() {
     r.stream?.getTracks().forEach((t: any) => t.stop());
     refs.current = {};
     setStatus("idle");
+    setErrorMessage(null);
     setInputLevel(0);
     setTuning({ note: "-", cents: 0 });
   }, []);
 
-  const apply = useCallback((params: any) => {
-    const r = refs.current;
-    if (!r.ctx) return;
-    const now = r.ctx.currentTime;
-    const set = (node: any, param: string, val: number) => node[param].setTargetAtTime(val, now, 0.01);
-
-    if (params.noiseGate !== undefined) {
-      // If gate is enabled (params.noiseGate is true), we use the threshold.
-      // If disabled, we pass the signal through (gain 1).
-      // Note: This is a simplified gate.
-      set(r.gateGain, "gain", params.noiseGate ? 1 : 1);
-      // To properly implement a gate, we would need a DynamicsCompressorNode 
-      // or a custom ScriptProcessor/AudioWorklet, but for now we'll just 
-      // ensure the threshold is applied if it's a compressor-based gate.
-      set(r.compressor, "threshold", params.noiseGate ? (params.threshold ?? -40) : 0);
-    }
-    if (params.compressor) {
-      const c = params.compressor;
-      if (c.enabled !== undefined) {
-        set(r.compressor, "threshold", c.enabled ? (c.threshold ?? -24) : 0);
-        set(r.compressor, "ratio", c.enabled ? (c.ratio ?? 4) : 1);
-      }
-    }
-    if (params.eq) {
-      const e = params.eq;
-      if (e.low !== undefined)  { r.eqLow.frequency.value = e.lowFreq ?? 200;  set(r.eqLow,  "gain", e.enabled ? e.low  : 0); }
-      if (e.mid !== undefined)  { r.eqMid.frequency.value = e.midFreq ?? 1000; set(r.eqMid,  "gain", e.enabled ? e.mid  : 0); }
-      if (e.high !== undefined) { r.eqHigh.frequency.value= e.highFreq?? 4000; set(r.eqHigh, "gain", e.enabled ? e.high : 0); }
-    }
-    if (params.drive) {
-      const d = params.drive;
-      const pre = d.enabled ? 1 + d.gain * 150 : 0;
-      set(r.drivePre, "gain", pre);
-      set(r.dryGain, "gain", d.enabled ? 0 : 1);
-      set(r.drivePost, "gain", d.level * 0.5);
-      r.driveTone.frequency.value = 500 + d.tone * 8000;
-      if (d.enabled) {
-        r.driveShaper.curve =
-          d.mode === "overdrive"   ? makeOverdriveCurve(d.gain)  :
-          d.mode === "distortion"  ? makeDistortionCurve(d.gain) :
-          makeFuzzCurve(d.gain);
-      } else {
-        r.driveShaper.curve = null;
-      }
-    }
-    if (params.mod) {
-      const m = params.mod;
-      r.modShape = m.shape ?? "sine";
-      
-      if (m.shape === "random") {
-        r.modLFOGain.disconnect();
-      } else {
-        try { r.modLFOGain.connect(r.modDelay.delayTime); } catch(e) {}
-        r.modLFO.type = m.shape ?? "sine";
-        r.modLFO.frequency.value = m.rate ?? 1.5;
-      }
-      
-      if (m.mode === "tremolo") {
-        // Tremolo: Modulate amplitude
-        set(r.modLFOGain, "gain", m.enabled ? (m.depth ?? 0.5) * 0.5 : 0);
-        set(r.modWet, "gain", m.enabled ? (m.mix ?? 0.5) : 0);
-        set(r.modFB, "gain", 0);
-        r.modDelay.delayTime.value = 0; // Bypass delay
-      } else {
-        // Chorus/Flanger/Phaser: Modulate delay time
-        set(r.modLFOGain, "gain", m.enabled ? (m.depth ?? 0.5) * 0.008 : 0);
-        set(r.modWet, "gain", m.enabled ? (m.mix ?? 0.5) : 0);
-        set(r.modFB, "gain", m.enabled && m.mode === "flanger" ? 0.5 : 0);
-        if (m.shape !== "random") {
-          r.modDelay.delayTime.value = m.mode === "flanger" ? 0.005 : 0.02;
-        }
-      }
-    }
-    if (params.delay) {
-      const d = params.delay;
-      r.delayNode.delayTime.value = d.time ?? 0.4;
-      set(r.delayFB, "gain", d.enabled ? Math.min(d.feedback ?? 0.4, 0.95) : 0);
-      set(r.delayWet, "gain", d.enabled ? (d.mix ?? 0.35) : 0);
-      set(r.delayDry, "gain", 1);
-    }
-    if (params.amp) {
-      const a = params.amp;
-      r.ampNode.frequency.value = 2000 + a.tone * 8000;
-      set(r.ampGain, "gain", a.enabled ? a.gain : 1);
-      set(r.ampLevel, "gain", a.enabled ? a.level : 0);
-    }
-    if (params.reverb) {
-      const rv = params.reverb;
-      if (rv.enabled) {
-        r.reverbConv.buffer = buildReverbIR(r.ctx, rv.roomSize ?? 0.5, rv.damping ?? 0.5);
-      }
-      set(r.reverbWet, "gain", rv.enabled ? (rv.mix ?? 0.3) : 0);
-      set(r.reverbDry, "gain", 1);
-    }
-    if (params.master !== undefined) {
-      set(r.masterGain, "gain", params.mute ? 0 : params.master);
-    }
-  }, []);
-
   useEffect(() => () => stop(), [stop]);
-  return { status, inputLevel, tuning, isExternal, start, stop, apply };
+  return { status, setStatus, errorMessage, setErrorMessage, inputLevel, tuning, isExternal, setIsExternal, start, stop, apply };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -536,7 +538,7 @@ const MOD_MODES   = ["chorus", "flanger", "phaser", "tremolo"];
 const LFO_SHAPES  = ["sine", "triangle", "square", "sawtooth", "random"];
 
 export default function App() {
-  const { status, inputLevel, tuning, isExternal, start, stop, apply } = useAudioEngine();
+  const { status, setStatus, errorMessage, setErrorMessage, inputLevel, tuning, isExternal, setIsExternal, start, stop, apply } = useAudioEngine();
   const [volume, setVolume] = useState(0.8);
   const [activeTab, setActiveTab] = useState("Dynamics");
   const tabs = ["Dynamics", "Tone", "Modulation", "Space"];
@@ -906,6 +908,57 @@ export default function App() {
                 >
                   Start Audio Engine
                 </button>
+              </div>
+            </div>
+          </motion.div>
+        )}
+
+        {!isActive && status === "error" && (
+          <motion.div 
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="fixed bottom-8 left-1/2 -translate-x-1/2 w-[calc(100%-2rem)] max-w-md p-4 rounded-2xl bg-red-900/20 border border-red-500/50 shadow-2xl z-50 backdrop-blur-md"
+          >
+            <div className="flex items-start gap-4">
+              <div className="p-3 rounded-xl bg-red-600/10 text-red-500 shrink-0">
+                <AlertCircle size={20} />
+              </div>
+              <div className="flex-1">
+                <h3 className="text-sm font-bold text-white mb-1">Access Required</h3>
+                <p className="text-xs text-zinc-400 leading-relaxed mb-4">
+                  {errorMessage || "Microphone access is required to use ToneMaster. Please check your browser settings and try again."}
+                </p>
+                <button 
+                  onClick={() => { setStatus("idle"); setErrorMessage(null); }}
+                  className="w-full py-2.5 rounded-lg bg-zinc-800 text-white text-[10px] font-bold uppercase tracking-widest hover:bg-zinc-700 transition-colors mb-4"
+                >
+                  Try Again
+                </button>
+
+                <div className="pt-4 border-t border-red-500/20">
+                  <div className="flex items-center gap-2 mb-2">
+                    <HelpCircle size={12} className="text-red-400" />
+                    <h4 className="text-[10px] font-bold text-red-400 uppercase tracking-wider">Troubleshooting</h4>
+                  </div>
+                  <ul className="text-[10px] text-zinc-500 space-y-1.5 list-none">
+                    <li className="flex gap-2">
+                      <span className="text-red-500/50">•</span>
+                      <span>Click the <b>camera/mic icon</b> in your browser's address bar.</span>
+                    </li>
+                    <li className="flex gap-2">
+                      <span className="text-red-500/50">•</span>
+                      <span>Ensure <b>"Allow"</b> is selected for this site.</span>
+                    </li>
+                    <li className="flex gap-2">
+                      <span className="text-red-500/50">•</span>
+                      <span>Check if another application is using your microphone.</span>
+                    </li>
+                    <li className="flex gap-2">
+                      <span className="text-red-500/50">•</span>
+                      <span>Refresh the page and try starting again.</span>
+                    </li>
+                  </ul>
+                </div>
               </div>
             </div>
           </motion.div>
